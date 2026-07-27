@@ -6,8 +6,7 @@ __pycache__/
 .env
 .vscode/
 
-# Local data and internal reference documents
-data/raw/
+# Regenerable local data and internal reference documents
 data/interim/
-data/processed/
+*.parquet
 docs/data_dictionary/
