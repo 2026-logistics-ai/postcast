@@ -565,12 +565,20 @@ if len(spatial_reference_df) != len(dong_biz):
         f"{len(spatial_reference_df)}개 / 기준 {len(dong_biz)}개"
     )
 
-merged_df["load_score"] = np.round(
-    empirical_percentile_score(
-        merged_df["volume_per_courier"], normal_load_reference
-    ),
-    3,
-)
+scenario_load_score_columns = []
+for scenario in SCENARIOS:
+    load_column = f"volume_per_courier_{scenario}"
+    load_score_column = f"load_score_{scenario}"
+    merged_df[load_score_column] = np.round(
+        empirical_percentile_score(
+            merged_df[load_column], normal_load_reference
+        ),
+        3,
+    )
+    scenario_load_score_columns.append(load_score_column)
+
+# 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
+merged_df["load_score"] = merged_df["load_score_base"]
 merged_df["distance_score"] = np.round(
     empirical_percentile_score(
         merged_df["office_dong_distance_km"],
@@ -586,7 +594,11 @@ merged_df["area_score"] = np.round(
     3,
 )
 
-score_columns = ["load_score", "distance_score", "area_score"]
+score_columns = [
+    *scenario_load_score_columns,
+    "distance_score",
+    "area_score",
+]
 invalid_score_mask = (
     ~np.isfinite(merged_df[score_columns]).all(axis=1)
     | (merged_df[score_columns] < 0).any(axis=1)
@@ -594,6 +606,12 @@ invalid_score_mask = (
 )
 if invalid_score_mask.any():
     raise ValueError("0~100 범위를 벗어난 상대점수가 있습니다.")
+
+if not (
+    (merged_df["load_score_low"] <= merged_df["load_score_base"])
+    & (merged_df["load_score_base"] <= merged_df["load_score_high"])
+).all():
+    raise ValueError("부하점수가 낮음 ≤ 기준 ≤ 높음 순서가 아닙니다.")
 
 print(
     "상대점수 참조분포 생성 완료: "
@@ -614,20 +632,43 @@ if not np.isclose(
 ):
     raise ValueError("상대적 LT 지연 위험지수 가중치의 합이 1이 아닙니다.")
 
-merged_df["relative_lt_risk_index"] = np.round(
-    merged_df["load_score"] * LOAD_SCORE_WEIGHT
-    + merged_df["distance_score"] * DISTANCE_SCORE_WEIGHT
-    + merged_df["area_score"] * AREA_SCORE_WEIGHT,
-    3,
-)
+scenario_risk_index_columns = []
+for scenario in SCENARIOS:
+    risk_index_column = f"relative_lt_risk_index_{scenario}"
+    merged_df[risk_index_column] = np.round(
+        merged_df[f"load_score_{scenario}"] * LOAD_SCORE_WEIGHT
+        + merged_df["distance_score"] * DISTANCE_SCORE_WEIGHT
+        + merged_df["area_score"] * AREA_SCORE_WEIGHT,
+        3,
+    )
+    scenario_risk_index_columns.append(risk_index_column)
+
+# 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
+merged_df["relative_lt_risk_index"] = merged_df[
+    "relative_lt_risk_index_base"
+]
 
 invalid_relative_index_mask = (
-    ~np.isfinite(merged_df["relative_lt_risk_index"])
-    | (merged_df["relative_lt_risk_index"] < 0)
-    | (merged_df["relative_lt_risk_index"] > 100)
+    ~np.isfinite(merged_df[scenario_risk_index_columns]).all(axis=1)
+    | (merged_df[scenario_risk_index_columns] < 0).any(axis=1)
+    | (merged_df[scenario_risk_index_columns] > 100).any(axis=1)
 )
 if invalid_relative_index_mask.any():
     raise ValueError("0~100 범위를 벗어난 상대적 LT 지연 위험지수가 있습니다.")
+
+if not (
+    (
+        merged_df["relative_lt_risk_index_low"]
+        <= merged_df["relative_lt_risk_index_base"]
+    )
+    & (
+        merged_df["relative_lt_risk_index_base"]
+        <= merged_df["relative_lt_risk_index_high"]
+    )
+).all():
+    raise ValueError(
+        "상대적 LT 지연 위험지수가 낮음 ≤ 기준 ≤ 높음 순서가 아닙니다."
+    )
 
 # 9. 평시 위험지수 분포 기반 상대 위험등급 산정
 reference_spatial_score_df = pd.merge(
@@ -670,20 +711,47 @@ if not 0 <= medium_risk_threshold < high_risk_threshold <= 100:
         f"Medium={medium_risk_threshold}, High={high_risk_threshold}"
     )
 
-merged_df["relative_risk_level"] = np.select(
-    [
-        merged_df["relative_lt_risk_index"] >= high_risk_threshold,
-        merged_df["relative_lt_risk_index"] >= medium_risk_threshold,
-    ],
-    ["High", "Medium"],
-    default="Normal",
-)
+scenario_risk_level_columns = []
+for scenario in SCENARIOS:
+    risk_index_column = f"relative_lt_risk_index_{scenario}"
+    risk_level_column = f"relative_risk_level_{scenario}"
+    merged_df[risk_level_column] = np.select(
+        [
+            merged_df[risk_index_column] >= high_risk_threshold,
+            merged_df[risk_index_column] >= medium_risk_threshold,
+        ],
+        ["High", "Medium"],
+        default="Normal",
+    )
+    scenario_risk_level_columns.append(risk_level_column)
+
+# 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
+merged_df["relative_risk_level"] = merged_df[
+    "relative_risk_level_base"
+]
 
 valid_risk_levels = {"Normal", "Medium", "High"}
-if not set(merged_df["relative_risk_level"].unique()).issubset(
-    valid_risk_levels
-):
+calculated_risk_levels = set(
+    merged_df[scenario_risk_level_columns].stack().unique()
+)
+if not calculated_risk_levels.issubset(valid_risk_levels):
     raise ValueError("정의되지 않은 상대 위험등급이 산출되었습니다.")
+
+risk_level_order = {"Normal": 0, "Medium": 1, "High": 2}
+low_level_order = merged_df["relative_risk_level_low"].map(
+    risk_level_order
+)
+base_level_order = merged_df["relative_risk_level_base"].map(
+    risk_level_order
+)
+high_level_order = merged_df["relative_risk_level_high"].map(
+    risk_level_order
+)
+if not (
+    (low_level_order <= base_level_order)
+    & (base_level_order <= high_level_order)
+).all():
+    raise ValueError("상대 위험등급이 낮음 ≤ 기준 ≤ 높음 순서가 아닙니다.")
 
 print(
     "상대 위험등급 경계 산정 완료: "
@@ -701,48 +769,64 @@ if merged_df.duplicated(["date", "행정동"]).any():
         "날짜와 행정동 조합이 중복되어 우선순위를 산정할 수 없습니다."
     )
 
-priority_order_index = merged_df.sort_values(
-    by=[
-        "date",
-        "relative_lt_risk_index",
-        "volume_per_courier",
-        "office_dong_distance_km",
-        "행정동",
-    ],
-    ascending=[True, False, False, False, True],
-    kind="mergesort",
-).index
-priority_rank_values = (
-    merged_df.loc[priority_order_index]
-    .groupby("date", sort=False)
-    .cumcount()
-    + 1
-)
-priority_rank_by_index = pd.Series(
-    priority_rank_values.to_numpy(), index=priority_order_index
-)
-merged_df["daily_priority_rank"] = (
-    priority_rank_by_index.reindex(merged_df.index).astype(int)
-)
+def calculate_daily_priority_rank(df, scenario):
+    risk_index_column = f"relative_lt_risk_index_{scenario}"
+    load_column = f"volume_per_courier_{scenario}"
+    priority_order_index = df.sort_values(
+        by=[
+            "date",
+            risk_index_column,
+            load_column,
+            "office_dong_distance_km",
+            "행정동",
+        ],
+        ascending=[True, False, False, False, True],
+        kind="mergesort",
+    ).index
+    priority_rank_values = (
+        df.loc[priority_order_index]
+        .groupby("date", sort=False)
+        .cumcount()
+        + 1
+    )
+    priority_rank_by_index = pd.Series(
+        priority_rank_values.to_numpy(), index=priority_order_index
+    )
+    return priority_rank_by_index.reindex(df.index).astype(int)
+
+
+scenario_priority_rank_columns = []
+for scenario in SCENARIOS:
+    rank_column = f"daily_priority_rank_{scenario}"
+    merged_df[rank_column] = calculate_daily_priority_rank(
+        merged_df, scenario
+    )
+    scenario_priority_rank_columns.append(rank_column)
+
+# 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
+merged_df["daily_priority_rank"] = merged_df[
+    "daily_priority_rank_base"
+]
 
 expected_daily_dong_count = len(dong_biz)
-daily_rank_validation = merged_df.groupby("date")[
-    "daily_priority_rank"
-].agg(["count", "nunique", "min", "max"])
-invalid_daily_rank_mask = (
-    (daily_rank_validation["count"] != expected_daily_dong_count)
-    | (daily_rank_validation["nunique"] != expected_daily_dong_count)
-    | (daily_rank_validation["min"] != 1)
-    | (daily_rank_validation["max"] != expected_daily_dong_count)
-)
-if invalid_daily_rank_mask.any():
-    invalid_dates = daily_rank_validation.index[
-        invalid_daily_rank_mask
-    ].astype(str).tolist()
-    raise ValueError(
-        "1~82위 우선순위가 완전하게 생성되지 않은 날짜가 있습니다: "
-        f"{invalid_dates}"
+for rank_column in scenario_priority_rank_columns:
+    daily_rank_validation = merged_df.groupby("date")[rank_column].agg(
+        ["count", "nunique", "min", "max"]
     )
+    invalid_daily_rank_mask = (
+        (daily_rank_validation["count"] != expected_daily_dong_count)
+        | (daily_rank_validation["nunique"] != expected_daily_dong_count)
+        | (daily_rank_validation["min"] != 1)
+        | (daily_rank_validation["max"] != expected_daily_dong_count)
+    )
+    if invalid_daily_rank_mask.any():
+        invalid_dates = daily_rank_validation.index[
+            invalid_daily_rank_mask
+        ].astype(str).tolist()
+        raise ValueError(
+            f"{rank_column}에서 1~{expected_daily_dong_count}위가 "
+            f"완전하게 생성되지 않은 날짜가 있습니다: {invalid_dates}"
+        )
 
 # 11. 기존 LT (Lead Time) 산정 로직
 # 최종 위험등급을 교체하기 전 비교 검증을 위해 기존 산식을 유지한다.
@@ -811,12 +895,20 @@ print(
             "volume_per_courier_high",
             "office_dong_distance_km",
             "sqrt_area_km",
+            "load_score_low",
             "load_score",
+            "load_score_high",
             "distance_score",
             "area_score",
+            "relative_lt_risk_index_low",
             "relative_lt_risk_index",
+            "relative_lt_risk_index_high",
+            "relative_risk_level_low",
             "relative_risk_level",
+            "relative_risk_level_high",
+            "daily_priority_rank_low",
             "daily_priority_rank",
+            "daily_priority_rank_high",
             "total_lt_hours",
             "overall_risk",
         ]
