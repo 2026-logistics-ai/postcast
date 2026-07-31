@@ -828,58 +828,19 @@ for rank_column in scenario_priority_rank_columns:
             f"완전하게 생성되지 않은 날짜가 있습니다: {invalid_dates}"
         )
 
-# 11. 기존 LT (Lead Time) 산정 로직
-# 최종 위험등급을 교체하기 전 비교 검증을 위해 기존 산식을 유지한다.
-merged_df["travel_time_min"] = round(
-    np.sqrt(merged_df["면적"]) * 15, 1
-)  # 이동 소요시간(분)
-merged_df["delivery_time_min"] = round(
-    merged_df["volume_per_courier"] * 1.5, 1
-)  # 배달 소요시간(분)
-merged_df["total_lt_hours"] = round(
-    (
-        merged_df["travel_time_min"]
-        + merged_df["delivery_time_min"]
-    )
-    / 60,
-    2,
-)  # 총 LT(시간)
-
-# 12. 기존 과부하 및 지연 위험도(Risk) 종합 산정
-load_threshold = merged_df["volume_per_courier"].quantile(0.90)
-lt_threshold = merged_df["total_lt_hours"].quantile(0.90)
-
-
-def calculate_risk(row):
-    if (
-        row["volume_per_courier"] >= load_threshold
-        or row["total_lt_hours"] >= lt_threshold
-    ):
-        return "High"
-    elif (
-        row["volume_per_courier"] >= load_threshold * 0.7
-        or row["total_lt_hours"] >= lt_threshold * 0.7
-    ):
-        return "Medium"
-    else:
-        return "Normal"
-
-
-merged_df["overall_risk"] = merged_df.apply(calculate_risk, axis=1)
-
 print(
-    "행정동별 배분, 상대적 LT 지연 위험지수·등급·우선순위 및 "
-    "기존 LT·위험도 계산 완료!"
+    "행정동별 배분 및 시나리오별 상대적 LT 지연 "
+    "위험지수·등급·우선순위 계산 완료!"
 )
 
-# 13. 최종 결과 CSV 파일로 저장
+# 11. 최종 결과 CSV 파일로 저장
 output_filename = (
     PROJECT_ROOT
     / "data/processed/district_allocation_load_risk_results.csv"
 )
 merged_df.to_csv(output_filename, index=False, encoding="utf-8-sig")
 
-print("\n모든 분석 및 LT 산정이 완료되었습니다")
+print("\n모든 행정동 배분 및 상대 위험지수 산정이 완료되었습니다")
 print(f"결과 파일 업데이트 완료: {output_filename}")
 print("\n--- [최종 결과 샘플 5건] ---")
 print(
@@ -909,8 +870,6 @@ print(
             "daily_priority_rank_low",
             "daily_priority_rank",
             "daily_priority_rank_high",
-            "total_lt_hours",
-            "overall_risk",
         ]
     ].head()
 )
