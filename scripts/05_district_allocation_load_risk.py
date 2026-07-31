@@ -289,9 +289,12 @@ for idx, row in pred_df.iterrows():
             else 0.0
         )
 
+        no_event_allocated_volume = (
+            baseline_vol * dong["weight_baseline"]
+        )
         allocated_volumes = {
             scenario: (
-                baseline_vol * dong["weight_baseline"]
+                no_event_allocated_volume
                 + event_volumes[scenario] * event_weight
             )
             for scenario in SCENARIOS
@@ -304,6 +307,9 @@ for idx, row in pred_df.iterrows():
                 "event_type": event_type,
                 "plan_ids": "|".join(active_plan_ids) or "없음",
                 "allocation_event_type": allocation_event_type,
+                "no_event_allocated_volume": round(
+                    no_event_allocated_volume, 2
+                ),
                 "allocated_volume_low": round(
                     allocated_volumes["low"], 2
                 ),
@@ -367,7 +373,13 @@ if invalid_area_mask.any():
     )
 
 # 5. 시나리오별 집배원 1인당 부하량 계산
+merged_df["no_event_volume_per_courier"] = np.round(
+    merged_df["no_event_allocated_volume"] / merged_df["집배원수"], 2
+)
+
 scenario_load_columns = []
+scenario_event_added_volume_columns = []
+scenario_event_added_load_columns = []
 for scenario in SCENARIOS:
     allocated_column = f"allocated_volume_{scenario}"
     load_column = f"volume_per_courier_{scenario}"
@@ -376,14 +388,38 @@ for scenario in SCENARIOS:
     )
     scenario_load_columns.append(load_column)
 
+    event_added_volume_column = f"event_added_volume_{scenario}"
+    event_added_load_column = f"event_added_volume_per_courier_{scenario}"
+    merged_df[event_added_volume_column] = np.round(
+        merged_df[allocated_column]
+        - merged_df["no_event_allocated_volume"],
+        2,
+    )
+    merged_df[event_added_load_column] = np.round(
+        merged_df[load_column]
+        - merged_df["no_event_volume_per_courier"],
+        2,
+    )
+    scenario_event_added_volume_columns.append(event_added_volume_column)
+    scenario_event_added_load_columns.append(event_added_load_column)
+
 # 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
 merged_df["volume_per_courier"] = merged_df[
     "volume_per_courier_base"
 ]
 
 invalid_load_mask = (
-    ~np.isfinite(merged_df[scenario_load_columns]).all(axis=1)
-    | (merged_df[scenario_load_columns] < 0).any(axis=1)
+    ~np.isfinite(
+        merged_df[
+            ["no_event_volume_per_courier", *scenario_load_columns]
+        ]
+    ).all(axis=1)
+    | (
+        merged_df[
+            ["no_event_volume_per_courier", *scenario_load_columns]
+        ]
+        < 0
+    ).any(axis=1)
 )
 if invalid_load_mask.any():
     invalid_dongs = sorted(
@@ -393,6 +429,36 @@ if invalid_load_mask.any():
         "집배원 1인당 예상 물량이 유효하지 않은 행정동이 있습니다: "
         f"{invalid_dongs}"
     )
+
+event_added_columns = [
+    *scenario_event_added_volume_columns,
+    *scenario_event_added_load_columns,
+]
+if (
+    ~np.isfinite(merged_df[event_added_columns]).all(axis=1)
+    | (merged_df[event_added_columns] < 0).any(axis=1)
+).any():
+    raise ValueError(
+        "이벤트 추가 물량에 음수 또는 유효하지 않은 값이 있습니다."
+    )
+
+for column_prefix in [
+    "event_added_volume",
+    "event_added_volume_per_courier",
+]:
+    if not (
+        (
+            merged_df[f"{column_prefix}_low"]
+            <= merged_df[f"{column_prefix}_base"]
+        )
+        & (
+            merged_df[f"{column_prefix}_base"]
+            <= merged_df[f"{column_prefix}_high"]
+        )
+    ).all():
+        raise ValueError(
+            f"{column_prefix}이 낮음 ≤ 기준 ≤ 높음 순서가 아닙니다."
+        )
 
 # 6. 상대적 LT 지연 위험지수 산정을 위한 지리 기초 변수 생성
 coordinate_columns = [
@@ -565,6 +631,14 @@ if len(spatial_reference_df) != len(dong_biz):
         f"{len(spatial_reference_df)}개 / 기준 {len(dong_biz)}개"
     )
 
+merged_df["no_event_load_score"] = np.round(
+    empirical_percentile_score(
+        merged_df["no_event_volume_per_courier"],
+        normal_load_reference,
+    ),
+    3,
+)
+
 scenario_load_score_columns = []
 for scenario in SCENARIOS:
     load_column = f"volume_per_courier_{scenario}"
@@ -595,6 +669,7 @@ merged_df["area_score"] = np.round(
 )
 
 score_columns = [
+    "no_event_load_score",
     *scenario_load_score_columns,
     "distance_score",
     "area_score",
@@ -643,15 +718,55 @@ for scenario in SCENARIOS:
     )
     scenario_risk_index_columns.append(risk_index_column)
 
+merged_df["no_event_relative_lt_risk_index"] = np.round(
+    merged_df["no_event_load_score"] * LOAD_SCORE_WEIGHT
+    + merged_df["distance_score"] * DISTANCE_SCORE_WEIGHT
+    + merged_df["area_score"] * AREA_SCORE_WEIGHT,
+    3,
+)
+
+scenario_event_risk_delta_columns = []
+for scenario in SCENARIOS:
+    event_risk_delta_column = f"event_risk_delta_{scenario}"
+    merged_df[event_risk_delta_column] = np.round(
+        merged_df[f"relative_lt_risk_index_{scenario}"]
+        - merged_df["no_event_relative_lt_risk_index"],
+        3,
+    )
+    scenario_event_risk_delta_columns.append(event_risk_delta_column)
+
 # 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
 merged_df["relative_lt_risk_index"] = merged_df[
     "relative_lt_risk_index_base"
 ]
 
 invalid_relative_index_mask = (
-    ~np.isfinite(merged_df[scenario_risk_index_columns]).all(axis=1)
-    | (merged_df[scenario_risk_index_columns] < 0).any(axis=1)
-    | (merged_df[scenario_risk_index_columns] > 100).any(axis=1)
+    ~np.isfinite(
+        merged_df[
+            [
+                "no_event_relative_lt_risk_index",
+                *scenario_risk_index_columns,
+            ]
+        ]
+    ).all(axis=1)
+    | (
+        merged_df[
+            [
+                "no_event_relative_lt_risk_index",
+                *scenario_risk_index_columns,
+            ]
+        ]
+        < 0
+    ).any(axis=1)
+    | (
+        merged_df[
+            [
+                "no_event_relative_lt_risk_index",
+                *scenario_risk_index_columns,
+            ]
+        ]
+        > 100
+    ).any(axis=1)
 )
 if invalid_relative_index_mask.any():
     raise ValueError("0~100 범위를 벗어난 상대적 LT 지연 위험지수가 있습니다.")
@@ -669,6 +784,28 @@ if not (
     raise ValueError(
         "상대적 LT 지연 위험지수가 낮음 ≤ 기준 ≤ 높음 순서가 아닙니다."
     )
+
+if (
+    ~np.isfinite(merged_df[scenario_event_risk_delta_columns]).all(axis=1)
+    | (merged_df[scenario_event_risk_delta_columns] < 0).any(axis=1)
+).any():
+    raise ValueError(
+        "이벤트 위험 증가량에 음수 또는 유효하지 않은 값이 있습니다."
+    )
+
+if not (
+    (merged_df["event_risk_delta_low"] <= merged_df["event_risk_delta_base"])
+    & (
+        merged_df["event_risk_delta_base"]
+        <= merged_df["event_risk_delta_high"]
+    )
+).all():
+    raise ValueError(
+        "이벤트 위험 증가량이 낮음 ≤ 기준 ≤ 높음 순서가 아닙니다."
+    )
+
+# 기준 시나리오 별칭
+merged_df["event_risk_delta"] = merged_df["event_risk_delta_base"]
 
 # 9. 평시 위험지수 분포 기반 상대 위험등급 산정
 reference_spatial_score_df = pd.merge(
@@ -828,12 +965,99 @@ for rank_column in scenario_priority_rank_columns:
             f"완전하게 생성되지 않은 날짜가 있습니다: {invalid_dates}"
         )
 
+# 11. 이벤트로 추가된 위험 증가량 기준 상승 우선순위 산정
+has_event_plan = merged_df["plan_ids"].astype(str).ne("없음")
+date_event_status_count = has_event_plan.groupby(merged_df["date"]).nunique()
+if (date_event_status_count > 1).any():
+    invalid_dates = date_event_status_count.index[
+        date_event_status_count > 1
+    ].astype(str).tolist()
+    raise ValueError(
+        "동일 날짜에 이벤트 계획 유무가 혼재되어 있습니다: "
+        f"{invalid_dates}"
+    )
+
+
+def calculate_event_uplift_rank(df, scenario, event_mask):
+    event_risk_delta_column = f"event_risk_delta_{scenario}"
+    event_added_load_column = (
+        f"event_added_volume_per_courier_{scenario}"
+    )
+    risk_index_column = f"relative_lt_risk_index_{scenario}"
+    event_df = df.loc[event_mask]
+    priority_order_index = event_df.sort_values(
+        by=[
+            "date",
+            event_risk_delta_column,
+            event_added_load_column,
+            risk_index_column,
+            "행정동",
+        ],
+        ascending=[True, False, False, False, True],
+        kind="mergesort",
+    ).index
+    priority_rank_values = (
+        event_df.loc[priority_order_index]
+        .groupby("date", sort=False)
+        .cumcount()
+        + 1
+    )
+    rank_by_index = pd.Series(
+        priority_rank_values.to_numpy(), index=priority_order_index
+    )
+    result = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    result.loc[priority_order_index] = rank_by_index.astype("Int64")
+    return result
+
+
+scenario_event_uplift_rank_columns = []
+for scenario in SCENARIOS:
+    rank_column = f"event_uplift_rank_{scenario}"
+    merged_df[rank_column] = calculate_event_uplift_rank(
+        merged_df, scenario, has_event_plan
+    )
+    scenario_event_uplift_rank_columns.append(rank_column)
+
+# 기준 시나리오 별칭
+merged_df["event_uplift_rank"] = merged_df["event_uplift_rank_base"]
+
+event_dates = merged_df.loc[has_event_plan, "date"].unique()
+for rank_column in scenario_event_uplift_rank_columns:
+    if merged_df.loc[~has_event_plan, rank_column].notna().any():
+        raise ValueError(
+            f"{rank_column}에 이벤트가 없는 날짜의 순위가 "
+            "생성되었습니다."
+        )
+
+    event_rank_validation = (
+        merged_df.loc[has_event_plan]
+        .groupby("date")[rank_column]
+        .agg(["count", "nunique", "min", "max"])
+        .reindex(event_dates)
+    )
+    invalid_event_rank_mask = (
+        (event_rank_validation["count"] != expected_daily_dong_count)
+        | (event_rank_validation["nunique"] != expected_daily_dong_count)
+        | (event_rank_validation["min"] != 1)
+        | (event_rank_validation["max"] != expected_daily_dong_count)
+    )
+    if invalid_event_rank_mask.any():
+        invalid_dates = event_rank_validation.index[
+            invalid_event_rank_mask
+        ].astype(str).tolist()
+        raise ValueError(
+            f"{rank_column}에서 이벤트 날짜의 1~"
+            f"{expected_daily_dong_count}위가 완전하게 생성되지 "
+            "않았습니다: "
+            f"{invalid_dates}"
+        )
+
 print(
     "행정동별 배분 및 시나리오별 상대적 LT 지연 "
-    "위험지수·등급·우선순위 계산 완료!"
+    "위험지수·등급·전체 및 이벤트 상승 우선순위 계산 완료!"
 )
 
-# 11. 최종 결과 CSV 파일로 저장
+# 12. 최종 결과 CSV 파일로 저장
 output_filename = (
     PROJECT_ROOT
     / "data/processed/district_allocation_load_risk_results.csv"
@@ -842,18 +1066,28 @@ merged_df.to_csv(output_filename, index=False, encoding="utf-8-sig")
 
 print("\n모든 행정동 배분 및 상대 위험지수 산정이 완료되었습니다")
 print(f"결과 파일 업데이트 완료: {output_filename}")
-print("\n--- [최종 결과 샘플 5건] ---")
+print("\n--- [이벤트 상승 우선순위 샘플 5건] ---")
 print(
-    merged_df.sort_values(["date", "daily_priority_rank"])[
+    merged_df.loc[has_event_plan].sort_values(
+        ["date", "event_uplift_rank_base"]
+    )[
         [
             "date",
             "행정동",
+            "no_event_allocated_volume",
             "allocated_volume_low",
             "allocated_volume",
             "allocated_volume_high",
+            "event_added_volume_low",
+            "event_added_volume_base",
+            "event_added_volume_high",
+            "no_event_volume_per_courier",
             "volume_per_courier_low",
             "volume_per_courier",
             "volume_per_courier_high",
+            "event_added_volume_per_courier_low",
+            "event_added_volume_per_courier_base",
+            "event_added_volume_per_courier_high",
             "office_dong_distance_km",
             "sqrt_area_km",
             "load_score_low",
@@ -861,15 +1095,22 @@ print(
             "load_score_high",
             "distance_score",
             "area_score",
+            "no_event_relative_lt_risk_index",
             "relative_lt_risk_index_low",
             "relative_lt_risk_index",
             "relative_lt_risk_index_high",
+            "event_risk_delta_low",
+            "event_risk_delta_base",
+            "event_risk_delta_high",
             "relative_risk_level_low",
             "relative_risk_level",
             "relative_risk_level_high",
             "daily_priority_rank_low",
             "daily_priority_rank",
             "daily_priority_rank_high",
+            "event_uplift_rank_low",
+            "event_uplift_rank_base",
+            "event_uplift_rank_high",
         ]
     ].head()
 )
