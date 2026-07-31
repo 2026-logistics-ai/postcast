@@ -20,11 +20,15 @@ dong_biz = pd.read_csv(
 po_coord = pd.read_csv(
     PROJECT_ROOT / "data/raw/reference/대전_통상배달국_좌표.csv"
 )
+bulk_plan = pd.read_csv(
+    PROJECT_ROOT / "data/raw/reference/bulk_dispatch_plan.csv"
+)
 
 # 컬럼명 공백 제거
 dong_biz.columns = dong_biz.columns.str.strip()
 dong_info.columns = dong_info.columns.str.strip()
 po_coord.columns = po_coord.columns.str.strip()
+bulk_plan.columns = bulk_plan.columns.str.strip()
 
 
 def validate_required_columns(df, required_columns, dataset_name):
@@ -40,6 +44,7 @@ validate_required_columns(
     {
         "접수일자",
         "active_event_types",
+        "plan_ids",
         "stage1_baseline_prediction",
         "plan_stage2_adjustment_base",
     },
@@ -54,6 +59,11 @@ validate_required_columns(
     dong_biz,
     {"행정동", "세대수", "사업체수"},
     "행정동별_사업체수_면적_세대_수(csv).csv",
+)
+validate_required_columns(
+    bulk_plan,
+    {"계획ID", "이벤트유형"},
+    "bulk_dispatch_plan.csv",
 )
 
 if dong_info["행정동명"].duplicated().any():
@@ -81,6 +91,19 @@ if dong_biz["행정동"].duplicated().any():
         f"중복 행정동이 있습니다: {duplicate_dongs}"
     )
 
+if bulk_plan["계획ID"].duplicated().any():
+    duplicate_plan_ids = sorted(
+        bulk_plan.loc[
+            bulk_plan["계획ID"].duplicated(keep=False), "계획ID"
+        ]
+        .astype(str)
+        .unique()
+    )
+    raise ValueError(
+        "bulk_dispatch_plan.csv에 중복 계획ID가 있습니다: "
+        f"{duplicate_plan_ids}"
+    )
+
 # '면적' 관련 컬럼명 유연하게 찾기
 area_col = [c for c in dong_biz.columns if "면적" in c]
 area_col_name = area_col[0] if area_col else None
@@ -100,6 +123,42 @@ dong_biz["weight_baseline"] = (
     dong_biz["weight_household"] + dong_biz["weight_business"]
 ) / 2
 
+# 실제 발송 대상의 지역별 구성비 자료가 공개되어 있지 않으므로,
+# 세대수와 사업체수를 각각 지역가입자와 사업장가입자의 대체지표로
+# 활용한 '세대수·사업체수 기반 공간배분 추정 가중치'를 사용한다.
+household_mix_ratio = total_households / (
+    total_households + total_businesses
+)
+business_mix_ratio = total_businesses / (
+    total_households + total_businesses
+)
+dong_biz["weight_mixed"] = (
+    household_mix_ratio * dong_biz["weight_household"]
+    + business_mix_ratio * dong_biz["weight_business"]
+)
+
+event_type_to_weight_column = {
+    "주거형": "weight_household",
+    "주거형(혼합)": "weight_household",
+    "사업체형": "weight_business",
+    "혼합형": "weight_mixed",
+}
+plan_event_type = bulk_plan.set_index("계획ID")[
+    "이벤트유형"
+].to_dict()
+
+
+def parse_plan_ids(value):
+    if pd.isna(value):
+        return []
+
+    plan_ids = [
+        plan_id.strip()
+        for plan_id in str(value).split("|")
+        if plan_id.strip() and plan_id.strip() != "없음"
+    ]
+    return plan_ids
+
 # 3. 행정동별 예측 물량 배분
 results = []
 for idx, row in pred_df.iterrows():
@@ -107,14 +166,48 @@ for idx, row in pred_df.iterrows():
     baseline_vol = row["stage1_baseline_prediction"]
     event_vol = row["plan_stage2_adjustment_base"]
     event_type = str(row.get("active_event_types", "None"))
+    active_plan_ids = parse_plan_ids(row.get("plan_ids"))
+
+    if not active_plan_ids:
+        if not np.isclose(event_vol, 0.0):
+            raise ValueError(
+                f"{date}: 이벤트 조정 물량은 {event_vol}통이지만 "
+                "plan_ids가 없습니다."
+            )
+        allocation_event_type = "없음"
+        event_weight_column = None
+    else:
+        if len(active_plan_ids) > 1:
+            raise ValueError(
+                f"{date}: 복수 계획ID {active_plan_ids}가 존재하지만 "
+                "이벤트별 조정 물량이 분리되어 있지 않습니다."
+            )
+
+        active_plan_id = active_plan_ids[0]
+        if active_plan_id not in plan_event_type:
+            raise ValueError(
+                f"{date}: bulk_dispatch_plan.csv에 없는 계획ID입니다: "
+                f"{active_plan_id}"
+            )
+
+        allocation_event_type = plan_event_type[active_plan_id]
+        if allocation_event_type not in event_type_to_weight_column:
+            raise ValueError(
+                f"{date}: 지원하지 않는 이벤트유형입니다: "
+                f"{allocation_event_type}"
+            )
+        event_weight_column = event_type_to_weight_column[
+            allocation_event_type
+        ]
 
     for _, dong in dong_biz.iterrows():
         dong_name = dong["행정동"]
 
-        if "사업소분" in event_type or "사업장" in event_type:
-            event_weight = dong["weight_business"]
-        else:
-            event_weight = dong["weight_household"]
+        event_weight = (
+            dong[event_weight_column]
+            if event_weight_column is not None
+            else 0.0
+        )
 
         allocated_vol = (
             baseline_vol * dong["weight_baseline"]
@@ -125,6 +218,8 @@ for idx, row in pred_df.iterrows():
                 "date": date,
                 "행정동": dong_name,
                 "event_type": event_type,
+                "plan_ids": "|".join(active_plan_ids) or "없음",
+                "allocation_event_type": allocation_event_type,
                 "allocated_volume": round(allocated_vol, 2),
             }
         )
