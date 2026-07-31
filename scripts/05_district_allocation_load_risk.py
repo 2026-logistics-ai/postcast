@@ -460,9 +460,10 @@ baseline_load_factor = (
     reference_dong_df["weight_baseline"].to_numpy(dtype=float)
     / reference_dong_df["집배원수"].to_numpy(dtype=float)
 )
-normal_load_reference = np.multiply.outer(
+normal_load_matrix = np.multiply.outer(
     normal_volume_array, baseline_load_factor
-).ravel()
+)
+normal_load_reference = normal_load_matrix.ravel()
 
 spatial_reference_df = merged_df.drop_duplicates("행정동")
 if len(spatial_reference_df) != len(dong_biz):
@@ -535,7 +536,69 @@ invalid_relative_index_mask = (
 if invalid_relative_index_mask.any():
     raise ValueError("0~100 범위를 벗어난 상대적 LT 지연 위험지수가 있습니다.")
 
-# 9. 기존 LT (Lead Time) 산정 로직
+# 9. 평시 위험지수 분포 기반 상대 위험등급 산정
+reference_spatial_score_df = pd.merge(
+    reference_dong_df[["행정동"]],
+    merged_df[
+        ["행정동", "distance_score", "area_score"]
+    ].drop_duplicates("행정동"),
+    on="행정동",
+    how="left",
+    validate="one_to_one",
+)
+if reference_spatial_score_df[
+    ["distance_score", "area_score"]
+].isna().any().any():
+    raise ValueError("평시 위험지수 참조분포의 공간점수가 누락되었습니다.")
+
+normal_load_score_matrix = empirical_percentile_score(
+    normal_load_matrix, normal_load_reference
+)
+normal_relative_risk_reference = (
+    normal_load_score_matrix * LOAD_SCORE_WEIGHT
+    + reference_spatial_score_df["distance_score"].to_numpy()[None, :]
+    * DISTANCE_SCORE_WEIGHT
+    + reference_spatial_score_df["area_score"].to_numpy()[None, :]
+    * AREA_SCORE_WEIGHT
+).ravel()
+
+MEDIUM_RISK_QUANTILE = 0.75
+HIGH_RISK_QUANTILE = 0.90
+medium_risk_threshold = float(
+    np.quantile(normal_relative_risk_reference, MEDIUM_RISK_QUANTILE)
+)
+high_risk_threshold = float(
+    np.quantile(normal_relative_risk_reference, HIGH_RISK_QUANTILE)
+)
+
+if not 0 <= medium_risk_threshold < high_risk_threshold <= 100:
+    raise ValueError(
+        "평시 기준 상대 위험등급 경계값이 유효하지 않습니다: "
+        f"Medium={medium_risk_threshold}, High={high_risk_threshold}"
+    )
+
+merged_df["relative_risk_level"] = np.select(
+    [
+        merged_df["relative_lt_risk_index"] >= high_risk_threshold,
+        merged_df["relative_lt_risk_index"] >= medium_risk_threshold,
+    ],
+    ["High", "Medium"],
+    default="Normal",
+)
+
+valid_risk_levels = {"Normal", "Medium", "High"}
+if not set(merged_df["relative_risk_level"].unique()).issubset(
+    valid_risk_levels
+):
+    raise ValueError("정의되지 않은 상대 위험등급이 산출되었습니다.")
+
+print(
+    "상대 위험등급 경계 산정 완료: "
+    f"Medium ≥ {medium_risk_threshold:.3f}, "
+    f"High ≥ {high_risk_threshold:.3f}"
+)
+
+# 10. 기존 LT (Lead Time) 산정 로직
 # 최종 위험등급을 교체하기 전 비교 검증을 위해 기존 산식을 유지한다.
 merged_df["travel_time_min"] = round(
     np.sqrt(merged_df["면적"]) * 15, 1
@@ -552,7 +615,7 @@ merged_df["total_lt_hours"] = round(
     2,
 )  # 총 LT(시간)
 
-# 10. 기존 과부하 및 지연 위험도(Risk) 종합 산정
+# 11. 기존 과부하 및 지연 위험도(Risk) 종합 산정
 load_threshold = merged_df["volume_per_courier"].quantile(0.90)
 lt_threshold = merged_df["total_lt_hours"].quantile(0.90)
 
@@ -574,9 +637,9 @@ def calculate_risk(row):
 
 merged_df["overall_risk"] = merged_df.apply(calculate_risk, axis=1)
 
-print("행정동별 배분, 상대적 LT 지연 위험지수 및 기존 LT·위험도 계산 완료!")
+print("행정동별 배분, 상대적 LT 지연 위험지수·등급 및 기존 LT·위험도 계산 완료!")
 
-# 11. 최종 결과 CSV 파일로 저장
+# 12. 최종 결과 CSV 파일로 저장
 output_filename = (
     PROJECT_ROOT
     / "data/processed/district_allocation_load_risk_results.csv"
@@ -599,6 +662,7 @@ print(
             "distance_score",
             "area_score",
             "relative_lt_risk_index",
+            "relative_risk_level",
             "total_lt_hours",
             "overall_risk",
         ]
