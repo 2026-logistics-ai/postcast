@@ -507,9 +507,36 @@ print(
     f"= {len(normal_load_reference)}건"
 )
 
-# 8. 기존 LT (Lead Time) 산정 로직
-# 다음 단계에서 상대적 LT 지연 위험지수로 교체할 예정이며,
-# 이번 단계에서는 비교 검증을 위해 기존 산식을 유지한다.
+# 8. 상대적 LT 지연 위험지수 산정
+# 실제 LT 시간이나 지연확률이 아니라, 평시 대비 부하와 공간적
+# 작업 제약을 결합한 현장 대응 우선순위용 상대지수이다.
+LOAD_SCORE_WEIGHT = 0.70
+DISTANCE_SCORE_WEIGHT = 0.20
+AREA_SCORE_WEIGHT = 0.10
+
+if not np.isclose(
+    LOAD_SCORE_WEIGHT + DISTANCE_SCORE_WEIGHT + AREA_SCORE_WEIGHT,
+    1.0,
+):
+    raise ValueError("상대적 LT 지연 위험지수 가중치의 합이 1이 아닙니다.")
+
+merged_df["relative_lt_risk_index"] = np.round(
+    merged_df["load_score"] * LOAD_SCORE_WEIGHT
+    + merged_df["distance_score"] * DISTANCE_SCORE_WEIGHT
+    + merged_df["area_score"] * AREA_SCORE_WEIGHT,
+    3,
+)
+
+invalid_relative_index_mask = (
+    ~np.isfinite(merged_df["relative_lt_risk_index"])
+    | (merged_df["relative_lt_risk_index"] < 0)
+    | (merged_df["relative_lt_risk_index"] > 100)
+)
+if invalid_relative_index_mask.any():
+    raise ValueError("0~100 범위를 벗어난 상대적 LT 지연 위험지수가 있습니다.")
+
+# 9. 기존 LT (Lead Time) 산정 로직
+# 최종 위험등급을 교체하기 전 비교 검증을 위해 기존 산식을 유지한다.
 merged_df["travel_time_min"] = round(
     np.sqrt(merged_df["면적"]) * 15, 1
 )  # 이동 소요시간(분)
@@ -525,7 +552,7 @@ merged_df["total_lt_hours"] = round(
     2,
 )  # 총 LT(시간)
 
-# 9. 기존 과부하 및 지연 위험도(Risk) 종합 산정
+# 10. 기존 과부하 및 지연 위험도(Risk) 종합 산정
 load_threshold = merged_df["volume_per_courier"].quantile(0.90)
 lt_threshold = merged_df["total_lt_hours"].quantile(0.90)
 
@@ -547,9 +574,9 @@ def calculate_risk(row):
 
 merged_df["overall_risk"] = merged_df.apply(calculate_risk, axis=1)
 
-print("행정동별 배분, 상대점수 및 기존 LT·위험도 계산 완료!")
+print("행정동별 배분, 상대적 LT 지연 위험지수 및 기존 LT·위험도 계산 완료!")
 
-# 10. 최종 결과 CSV 파일로 저장
+# 11. 최종 결과 CSV 파일로 저장
 output_filename = (
     PROJECT_ROOT
     / "data/processed/district_allocation_load_risk_results.csv"
@@ -571,6 +598,7 @@ print(
             "load_score",
             "distance_score",
             "area_score",
+            "relative_lt_risk_index",
             "total_lt_hours",
             "overall_risk",
         ]
