@@ -26,6 +26,61 @@ dong_biz.columns = dong_biz.columns.str.strip()
 dong_info.columns = dong_info.columns.str.strip()
 po_coord.columns = po_coord.columns.str.strip()
 
+
+def validate_required_columns(df, required_columns, dataset_name):
+    missing_columns = sorted(set(required_columns) - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            f"{dataset_name}에 필수 컬럼이 없습니다: {missing_columns}"
+        )
+
+
+validate_required_columns(
+    pred_df,
+    {
+        "접수일자",
+        "active_event_types",
+        "stage1_baseline_prediction",
+        "plan_stage2_adjustment_base",
+    },
+    "test_plan_stage2_predictions.csv",
+)
+validate_required_columns(
+    dong_info,
+    {"행정동명", "담당 집배원수(추정)"},
+    "행정동별_정보3.csv",
+)
+validate_required_columns(
+    dong_biz,
+    {"행정동", "세대수", "사업체수"},
+    "행정동별_사업체수_면적_세대_수(csv).csv",
+)
+
+if dong_info["행정동명"].duplicated().any():
+    duplicate_dongs = sorted(
+        dong_info.loc[
+            dong_info["행정동명"].duplicated(keep=False), "행정동명"
+        ]
+        .astype(str)
+        .unique()
+    )
+    raise ValueError(
+        f"행정동별_정보3.csv에 중복 행정동이 있습니다: {duplicate_dongs}"
+    )
+
+if dong_biz["행정동"].duplicated().any():
+    duplicate_dongs = sorted(
+        dong_biz.loc[
+            dong_biz["행정동"].duplicated(keep=False), "행정동"
+        ]
+        .astype(str)
+        .unique()
+    )
+    raise ValueError(
+        "행정동별_사업체수_면적_세대_수(csv).csv에 "
+        f"중복 행정동이 있습니다: {duplicate_dongs}"
+    )
+
 # '면적' 관련 컬럼명 유연하게 찾기
 area_col = [c for c in dong_biz.columns if "면적" in c]
 area_col_name = area_col[0] if area_col else None
@@ -77,23 +132,12 @@ for idx, row in pred_df.iterrows():
 allocated_df = pd.DataFrame(results)
 
 # 4. 집배원 정보 및 좌표/면적 결합
-dong_col = [
-    c for c in dong_info.columns if "행정동" in c or "동" in c
-][0]
-courier_col = [
-    c
-    for c in dong_info.columns
-    if "집배원" in c or "인원" in c or "수" in c
-]
-courier_col_name = courier_col[0] if courier_col else None
-
-dong_info_clean = dong_info.rename(columns={dong_col: "행정동"})
-if courier_col_name:
-    dong_info_clean = dong_info_clean.rename(
-        columns={courier_col_name: "집배원수"}
-    )
-else:
-    dong_info_clean["집배원수"] = 1
+dong_info_clean = dong_info.rename(
+    columns={
+        "행정동명": "행정동",
+        "담당 집배원수(추정)": "집배원수",
+    }
+)
 
 # 사업체수/면적 데이터 병합
 merged_df = pd.merge(
@@ -103,11 +147,23 @@ merged_df = pd.merge(
     merged_df, dong_biz[["행정동", "면적"]], on="행정동", how="left"
 )
 
-merged_df["집배원수"] = (
-    pd.to_numeric(merged_df["집배원수"], errors="coerce")
-    .fillna(1)
-    .replace(0, 1)
+merged_df["집배원수"] = pd.to_numeric(
+    merged_df["집배원수"], errors="coerce"
 )
+invalid_courier_mask = (
+    merged_df["집배원수"].isna() | (merged_df["집배원수"] <= 0)
+)
+if invalid_courier_mask.any():
+    invalid_dongs = sorted(
+        merged_df.loc[invalid_courier_mask, "행정동"]
+        .astype(str)
+        .unique()
+    )
+    raise ValueError(
+        "집배원 수가 누락되었거나 0 이하인 행정동이 있습니다: "
+        f"{invalid_dongs}"
+    )
+
 merged_df["면적"] = pd.to_numeric(
     merged_df["면적"], errors="coerce"
 ).fillna(1.0)
