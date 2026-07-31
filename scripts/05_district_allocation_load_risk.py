@@ -598,7 +598,60 @@ print(
     f"High ≥ {high_risk_threshold:.3f}"
 )
 
-# 10. 기존 LT (Lead Time) 산정 로직
+# 10. 날짜별 현장 대응 우선순위 산정
+if merged_df[["date", "행정동"]].isna().any().any():
+    raise ValueError(
+        "날짜별 우선순위 산정에 필요한 날짜 또는 행정동이 누락되었습니다."
+    )
+if merged_df.duplicated(["date", "행정동"]).any():
+    raise ValueError(
+        "날짜와 행정동 조합이 중복되어 우선순위를 산정할 수 없습니다."
+    )
+
+priority_order_index = merged_df.sort_values(
+    by=[
+        "date",
+        "relative_lt_risk_index",
+        "volume_per_courier",
+        "office_dong_distance_km",
+        "행정동",
+    ],
+    ascending=[True, False, False, False, True],
+    kind="mergesort",
+).index
+priority_rank_values = (
+    merged_df.loc[priority_order_index]
+    .groupby("date", sort=False)
+    .cumcount()
+    + 1
+)
+priority_rank_by_index = pd.Series(
+    priority_rank_values.to_numpy(), index=priority_order_index
+)
+merged_df["daily_priority_rank"] = (
+    priority_rank_by_index.reindex(merged_df.index).astype(int)
+)
+
+expected_daily_dong_count = len(dong_biz)
+daily_rank_validation = merged_df.groupby("date")[
+    "daily_priority_rank"
+].agg(["count", "nunique", "min", "max"])
+invalid_daily_rank_mask = (
+    (daily_rank_validation["count"] != expected_daily_dong_count)
+    | (daily_rank_validation["nunique"] != expected_daily_dong_count)
+    | (daily_rank_validation["min"] != 1)
+    | (daily_rank_validation["max"] != expected_daily_dong_count)
+)
+if invalid_daily_rank_mask.any():
+    invalid_dates = daily_rank_validation.index[
+        invalid_daily_rank_mask
+    ].astype(str).tolist()
+    raise ValueError(
+        "1~82위 우선순위가 완전하게 생성되지 않은 날짜가 있습니다: "
+        f"{invalid_dates}"
+    )
+
+# 11. 기존 LT (Lead Time) 산정 로직
 # 최종 위험등급을 교체하기 전 비교 검증을 위해 기존 산식을 유지한다.
 merged_df["travel_time_min"] = round(
     np.sqrt(merged_df["면적"]) * 15, 1
@@ -615,7 +668,7 @@ merged_df["total_lt_hours"] = round(
     2,
 )  # 총 LT(시간)
 
-# 11. 기존 과부하 및 지연 위험도(Risk) 종합 산정
+# 12. 기존 과부하 및 지연 위험도(Risk) 종합 산정
 load_threshold = merged_df["volume_per_courier"].quantile(0.90)
 lt_threshold = merged_df["total_lt_hours"].quantile(0.90)
 
@@ -637,9 +690,12 @@ def calculate_risk(row):
 
 merged_df["overall_risk"] = merged_df.apply(calculate_risk, axis=1)
 
-print("행정동별 배분, 상대적 LT 지연 위험지수·등급 및 기존 LT·위험도 계산 완료!")
+print(
+    "행정동별 배분, 상대적 LT 지연 위험지수·등급·우선순위 및 "
+    "기존 LT·위험도 계산 완료!"
+)
 
-# 12. 최종 결과 CSV 파일로 저장
+# 13. 최종 결과 CSV 파일로 저장
 output_filename = (
     PROJECT_ROOT
     / "data/processed/district_allocation_load_risk_results.csv"
@@ -650,7 +706,7 @@ print("\n모든 분석 및 LT 산정이 완료되었습니다")
 print(f"결과 파일 업데이트 완료: {output_filename}")
 print("\n--- [최종 결과 샘플 5건] ---")
 print(
-    merged_df[
+    merged_df.sort_values(["date", "daily_priority_rank"])[
         [
             "date",
             "행정동",
@@ -663,6 +719,7 @@ print(
             "area_score",
             "relative_lt_risk_index",
             "relative_risk_level",
+            "daily_priority_rank",
             "total_lt_hours",
             "overall_risk",
         ]
