@@ -52,7 +52,14 @@ validate_required_columns(
 )
 validate_required_columns(
     dong_info,
-    {"행정동명", "담당 집배원수(추정)"},
+    {
+        "행정동명",
+        "담당 집배원수(추정)",
+        "행정동_위도",
+        "행정동_경도",
+        "담당 우체국 위도",
+        "담당 우체국 경도",
+    },
     "행정동별_정보3.csv",
 )
 validate_required_columns(
@@ -259,16 +266,119 @@ if invalid_courier_mask.any():
         f"{invalid_dongs}"
     )
 
-merged_df["면적"] = pd.to_numeric(
-    merged_df["면적"], errors="coerce"
-).fillna(1.0)
+merged_df["면적"] = pd.to_numeric(merged_df["면적"], errors="coerce")
+invalid_area_mask = merged_df["면적"].isna() | (merged_df["면적"] <= 0)
+if invalid_area_mask.any():
+    invalid_dongs = sorted(
+        merged_df.loc[invalid_area_mask, "행정동"].astype(str).unique()
+    )
+    raise ValueError(
+        "면적이 누락되었거나 0 이하인 행정동이 있습니다: "
+        f"{invalid_dongs}"
+    )
 
 # 5. 집배원 1인당 부하량 계산
 merged_df["volume_per_courier"] = round(
     merged_df["allocated_volume"] / merged_df["집배원수"], 2
 )
 
-# 6. LT (Lead Time) 산정 로직 (거리 + 면적 + 물량 기반)
+invalid_load_mask = (
+    ~np.isfinite(merged_df["volume_per_courier"])
+    | (merged_df["volume_per_courier"] < 0)
+)
+if invalid_load_mask.any():
+    invalid_dongs = sorted(
+        merged_df.loc[invalid_load_mask, "행정동"].astype(str).unique()
+    )
+    raise ValueError(
+        "집배원 1인당 예상 물량이 유효하지 않은 행정동이 있습니다: "
+        f"{invalid_dongs}"
+    )
+
+# 6. 상대적 LT 지연 위험지수 산정을 위한 지리 기초 변수 생성
+coordinate_columns = [
+    "행정동_위도",
+    "행정동_경도",
+    "담당 우체국 위도",
+    "담당 우체국 경도",
+]
+for column in coordinate_columns:
+    merged_df[column] = pd.to_numeric(merged_df[column], errors="coerce")
+
+invalid_coordinate_mask = (
+    merged_df[coordinate_columns].isna().any(axis=1)
+    | ~merged_df["행정동_위도"].between(-90, 90)
+    | ~merged_df["담당 우체국 위도"].between(-90, 90)
+    | ~merged_df["행정동_경도"].between(-180, 180)
+    | ~merged_df["담당 우체국 경도"].between(-180, 180)
+)
+if invalid_coordinate_mask.any():
+    invalid_dongs = sorted(
+        merged_df.loc[invalid_coordinate_mask, "행정동"]
+        .astype(str)
+        .unique()
+    )
+    raise ValueError(
+        "행정동 또는 담당 우체국 좌표가 유효하지 않은 행정동이 있습니다: "
+        f"{invalid_dongs}"
+    )
+
+
+def haversine_distance_km(lat1, lon1, lat2, lon2):
+    """두 위경도 지점 사이의 대권거리(km)를 계산한다."""
+    earth_radius_km = 6371.0088
+    lat1_rad = np.radians(lat1)
+    lon1_rad = np.radians(lon1)
+    lat2_rad = np.radians(lat2)
+    lon2_rad = np.radians(lon2)
+
+    delta_lat = lat2_rad - lat1_rad
+    delta_lon = lon2_rad - lon1_rad
+    haversine_value = (
+        np.sin(delta_lat / 2) ** 2
+        + np.cos(lat1_rad)
+        * np.cos(lat2_rad)
+        * np.sin(delta_lon / 2) ** 2
+    )
+    central_angle = 2 * np.arcsin(
+        np.sqrt(np.clip(haversine_value, 0.0, 1.0))
+    )
+    return earth_radius_km * central_angle
+
+
+merged_df["office_dong_distance_km"] = np.round(
+    haversine_distance_km(
+        merged_df["담당 우체국 위도"],
+        merged_df["담당 우체국 경도"],
+        merged_df["행정동_위도"],
+        merged_df["행정동_경도"],
+    ),
+    3,
+)
+merged_df["sqrt_area_km"] = np.round(np.sqrt(merged_df["면적"]), 3)
+
+geographic_feature_columns = [
+    "office_dong_distance_km",
+    "sqrt_area_km",
+]
+invalid_geographic_feature_mask = (
+    ~np.isfinite(merged_df[geographic_feature_columns]).all(axis=1)
+    | (merged_df[geographic_feature_columns] < 0).any(axis=1)
+)
+if invalid_geographic_feature_mask.any():
+    invalid_dongs = sorted(
+        merged_df.loc[invalid_geographic_feature_mask, "행정동"]
+        .astype(str)
+        .unique()
+    )
+    raise ValueError(
+        "상대 위험지수 지리 기초 변수가 유효하지 않은 행정동이 있습니다: "
+        f"{invalid_dongs}"
+    )
+
+# 7. 기존 LT (Lead Time) 산정 로직
+# 다음 단계에서 상대적 LT 지연 위험지수로 교체할 예정이며,
+# 이번 단계에서는 비교 검증을 위해 기존 산식을 유지한다.
 merged_df["travel_time_min"] = round(
     np.sqrt(merged_df["면적"]) * 15, 1
 )  # 이동 소요시간(분)
@@ -284,7 +394,7 @@ merged_df["total_lt_hours"] = round(
     2,
 )  # 총 LT(시간)
 
-# 7. 과부하 및 지연 위험도(Risk) 종합 산정
+# 8. 기존 과부하 및 지연 위험도(Risk) 종합 산정
 load_threshold = merged_df["volume_per_courier"].quantile(0.90)
 lt_threshold = merged_df["total_lt_hours"].quantile(0.90)
 
@@ -308,7 +418,7 @@ merged_df["overall_risk"] = merged_df.apply(calculate_risk, axis=1)
 
 print("행정동별 배분, 집배원 부하, LT 산정 및 종합 위험도 계산 완료!")
 
-# 8. 최종 결과 CSV 파일로 저장
+# 9. 최종 결과 CSV 파일로 저장
 output_filename = (
     PROJECT_ROOT
     / "data/processed/district_allocation_load_risk_results.csv"
@@ -325,6 +435,8 @@ print(
             "행정동",
             "allocated_volume",
             "volume_per_courier",
+            "office_dong_distance_km",
+            "sqrt_area_km",
             "total_lt_hours",
             "overall_risk",
         ]
