@@ -47,7 +47,12 @@ validate_required_columns(
         "active_event_types",
         "plan_ids",
         "stage1_baseline_prediction",
+        "plan_stage2_adjustment_low",
         "plan_stage2_adjustment_base",
+        "plan_stage2_adjustment_high",
+        "plan_prediction_low",
+        "plan_prediction_base",
+        "plan_prediction_high",
     },
     "test_plan_stage2_predictions.csv",
 )
@@ -160,6 +165,60 @@ plan_event_type = bulk_plan.set_index("계획ID")[
     "이벤트유형"
 ].to_dict()
 
+SCENARIOS = ("low", "base", "high")
+adjustment_columns = {
+    scenario: f"plan_stage2_adjustment_{scenario}"
+    for scenario in SCENARIOS
+}
+prediction_columns = {
+    scenario: f"plan_prediction_{scenario}"
+    for scenario in SCENARIOS
+}
+
+numeric_prediction_columns = [
+    "stage1_baseline_prediction",
+    *adjustment_columns.values(),
+    *prediction_columns.values(),
+]
+for column in numeric_prediction_columns:
+    pred_df[column] = pd.to_numeric(pred_df[column], errors="coerce")
+
+if pred_df[numeric_prediction_columns].isna().any().any():
+    raise ValueError(
+        "test_plan_stage2_predictions.csv의 시나리오 예측 컬럼에 "
+        "숫자로 변환할 수 없는 값이 있습니다."
+    )
+
+if not (
+    (
+        pred_df[adjustment_columns["low"]]
+        <= pred_df[adjustment_columns["base"]]
+    )
+    & (
+        pred_df[adjustment_columns["base"]]
+        <= pred_df[adjustment_columns["high"]]
+    )
+).all():
+    raise ValueError("이벤트 조정 물량이 낮음 ≤ 기준 ≤ 높음 순서가 아닙니다.")
+
+for scenario in SCENARIOS:
+    expected_prediction = (
+        pred_df["stage1_baseline_prediction"]
+        + pred_df[adjustment_columns[scenario]]
+    )
+    if not np.allclose(
+        expected_prediction,
+        pred_df[prediction_columns[scenario]],
+    ):
+        raise ValueError(
+            f"{scenario} 시나리오의 최종 예측 물량이 "
+            "베이스라인과 이벤트 조정량의 합과 일치하지 않습니다."
+        )
+    if (expected_prediction < 0).any():
+        raise ValueError(
+            f"{scenario} 시나리오의 최종 예측 물량에 음수가 있습니다."
+        )
+
 
 def parse_plan_ids(value):
     if pd.isna(value):
@@ -177,14 +236,22 @@ results = []
 for idx, row in pred_df.iterrows():
     date = row["ds"] if "ds" in row else row.get("접수일자", idx)
     baseline_vol = row["stage1_baseline_prediction"]
-    event_vol = row["plan_stage2_adjustment_base"]
+    event_volumes = {
+        scenario: row[adjustment_columns[scenario]]
+        for scenario in SCENARIOS
+    }
     event_type = str(row.get("active_event_types", "None"))
     active_plan_ids = parse_plan_ids(row.get("plan_ids"))
 
     if not active_plan_ids:
-        if not np.isclose(event_vol, 0.0):
+        nonzero_adjustments = {
+            scenario: event_volume
+            for scenario, event_volume in event_volumes.items()
+            if not np.isclose(event_volume, 0.0)
+        }
+        if nonzero_adjustments:
             raise ValueError(
-                f"{date}: 이벤트 조정 물량은 {event_vol}통이지만 "
+                f"{date}: 이벤트 조정 물량은 {nonzero_adjustments}이지만 "
                 "plan_ids가 없습니다."
             )
         allocation_event_type = "없음"
@@ -222,9 +289,13 @@ for idx, row in pred_df.iterrows():
             else 0.0
         )
 
-        allocated_vol = (
-            baseline_vol * dong["weight_baseline"]
-        ) + (event_vol * event_weight)
+        allocated_volumes = {
+            scenario: (
+                baseline_vol * dong["weight_baseline"]
+                + event_volumes[scenario] * event_weight
+            )
+            for scenario in SCENARIOS
+        }
 
         results.append(
             {
@@ -233,7 +304,19 @@ for idx, row in pred_df.iterrows():
                 "event_type": event_type,
                 "plan_ids": "|".join(active_plan_ids) or "없음",
                 "allocation_event_type": allocation_event_type,
-                "allocated_volume": round(allocated_vol, 2),
+                "allocated_volume_low": round(
+                    allocated_volumes["low"], 2
+                ),
+                "allocated_volume_base": round(
+                    allocated_volumes["base"], 2
+                ),
+                "allocated_volume_high": round(
+                    allocated_volumes["high"], 2
+                ),
+                # 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
+                "allocated_volume": round(
+                    allocated_volumes["base"], 2
+                ),
             }
         )
 
@@ -283,14 +366,24 @@ if invalid_area_mask.any():
         f"{invalid_dongs}"
     )
 
-# 5. 집배원 1인당 부하량 계산
-merged_df["volume_per_courier"] = round(
-    merged_df["allocated_volume"] / merged_df["집배원수"], 2
-)
+# 5. 시나리오별 집배원 1인당 부하량 계산
+scenario_load_columns = []
+for scenario in SCENARIOS:
+    allocated_column = f"allocated_volume_{scenario}"
+    load_column = f"volume_per_courier_{scenario}"
+    merged_df[load_column] = np.round(
+        merged_df[allocated_column] / merged_df["집배원수"], 2
+    )
+    scenario_load_columns.append(load_column)
+
+# 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
+merged_df["volume_per_courier"] = merged_df[
+    "volume_per_courier_base"
+]
 
 invalid_load_mask = (
-    ~np.isfinite(merged_df["volume_per_courier"])
-    | (merged_df["volume_per_courier"] < 0)
+    ~np.isfinite(merged_df[scenario_load_columns]).all(axis=1)
+    | (merged_df[scenario_load_columns] < 0).any(axis=1)
 )
 if invalid_load_mask.any():
     invalid_dongs = sorted(
@@ -710,8 +803,12 @@ print(
         [
             "date",
             "행정동",
+            "allocated_volume_low",
             "allocated_volume",
+            "allocated_volume_high",
+            "volume_per_courier_low",
             "volume_per_courier",
+            "volume_per_courier_high",
             "office_dong_distance_km",
             "sqrt_area_km",
             "load_score",
