@@ -10,6 +10,7 @@ print("1. 데이터 불러오는 중...")
 pred_df = pd.read_csv(
     PROJECT_ROOT / "data/processed/test_plan_stage2_predictions.csv"
 )
+train_df = pd.read_csv(PROJECT_ROOT / "data/processed/train.csv")
 dong_info = pd.read_csv(
     PROJECT_ROOT / "data/raw/reference/행정동별_정보3.csv"
 )
@@ -49,6 +50,11 @@ validate_required_columns(
         "plan_stage2_adjustment_base",
     },
     "test_plan_stage2_predictions.csv",
+)
+validate_required_columns(
+    train_df,
+    {"접수통수", "is_event", "event_count"},
+    "train.csv",
 )
 validate_required_columns(
     dong_info,
@@ -346,6 +352,32 @@ def haversine_distance_km(lat1, lon1, lat2, lon2):
     return earth_radius_km * central_angle
 
 
+def empirical_percentile_score(values, reference_values):
+    """참조분포 내 위치를 평균순위 기반 0~100 점수로 변환한다."""
+    values_array = np.asarray(values, dtype=float)
+    reference_array = np.sort(np.asarray(reference_values, dtype=float))
+
+    if len(reference_array) < 2:
+        raise ValueError("백분위 점수 산정을 위한 참조값이 2개 미만입니다.")
+    if not np.isfinite(reference_array).all():
+        raise ValueError("백분위 점수 참조분포에 유효하지 않은 값이 있습니다.")
+    if not np.isfinite(values_array).all():
+        raise ValueError("백분위 점수 변환 대상에 유효하지 않은 값이 있습니다.")
+
+    left_rank = np.searchsorted(
+        reference_array, values_array, side="left"
+    )
+    right_rank = np.searchsorted(
+        reference_array, values_array, side="right"
+    )
+    midpoint_rank = (left_rank + right_rank - 1) / 2
+    scores = 100 * midpoint_rank / (len(reference_array) - 1)
+
+    scores = np.where(values_array <= reference_array[0], 0.0, scores)
+    scores = np.where(values_array >= reference_array[-1], 100.0, scores)
+    return np.clip(scores, 0.0, 100.0)
+
+
 merged_df["office_dong_distance_km"] = np.round(
     haversine_distance_km(
         merged_df["담당 우체국 위도"],
@@ -376,7 +408,106 @@ if invalid_geographic_feature_mask.any():
         f"{invalid_dongs}"
     )
 
-# 7. 기존 LT (Lead Time) 산정 로직
+# 7. 평시 참조분포 기반 0~100 상대점수 산정
+for column in ["접수통수", "is_event", "event_count"]:
+    train_df[column] = pd.to_numeric(train_df[column], errors="coerce")
+
+invalid_train_mask = train_df[
+    ["접수통수", "is_event", "event_count"]
+].isna().any(axis=1)
+if invalid_train_mask.any():
+    raise ValueError(
+        "train.csv의 접수통수 또는 이벤트 판정 컬럼에 "
+        "숫자로 변환할 수 없는 값이 있습니다."
+    )
+
+normal_train_df = train_df.loc[
+    (train_df["is_event"] == 0) & (train_df["event_count"] == 0)
+].copy()
+if normal_train_df.empty:
+    raise ValueError("train.csv에서 평시 참조일을 찾을 수 없습니다.")
+if (normal_train_df["접수통수"] < 0).any():
+    raise ValueError("평시 참조일의 접수통수에 음수가 있습니다.")
+
+reference_dong_df = pd.merge(
+    dong_biz[["행정동", "weight_baseline"]],
+    dong_info_clean[["행정동", "집배원수"]],
+    on="행정동",
+    how="left",
+)
+reference_dong_df["집배원수"] = pd.to_numeric(
+    reference_dong_df["집배원수"], errors="coerce"
+)
+invalid_reference_dong_mask = (
+    reference_dong_df["집배원수"].isna()
+    | (reference_dong_df["집배원수"] <= 0)
+    | ~np.isfinite(reference_dong_df["weight_baseline"])
+    | (reference_dong_df["weight_baseline"] < 0)
+)
+if invalid_reference_dong_mask.any():
+    invalid_dongs = sorted(
+        reference_dong_df.loc[invalid_reference_dong_mask, "행정동"]
+        .astype(str)
+        .unique()
+    )
+    raise ValueError(
+        "평시 부하 참조분포를 만들 수 없는 행정동이 있습니다: "
+        f"{invalid_dongs}"
+    )
+
+normal_volume_array = normal_train_df["접수통수"].to_numpy(dtype=float)
+baseline_load_factor = (
+    reference_dong_df["weight_baseline"].to_numpy(dtype=float)
+    / reference_dong_df["집배원수"].to_numpy(dtype=float)
+)
+normal_load_reference = np.multiply.outer(
+    normal_volume_array, baseline_load_factor
+).ravel()
+
+spatial_reference_df = merged_df.drop_duplicates("행정동")
+if len(spatial_reference_df) != len(dong_biz):
+    raise ValueError(
+        "공간 참조분포의 행정동 수가 기준정보와 일치하지 않습니다: "
+        f"{len(spatial_reference_df)}개 / 기준 {len(dong_biz)}개"
+    )
+
+merged_df["load_score"] = np.round(
+    empirical_percentile_score(
+        merged_df["volume_per_courier"], normal_load_reference
+    ),
+    3,
+)
+merged_df["distance_score"] = np.round(
+    empirical_percentile_score(
+        merged_df["office_dong_distance_km"],
+        spatial_reference_df["office_dong_distance_km"],
+    ),
+    3,
+)
+merged_df["area_score"] = np.round(
+    empirical_percentile_score(
+        merged_df["sqrt_area_km"],
+        spatial_reference_df["sqrt_area_km"],
+    ),
+    3,
+)
+
+score_columns = ["load_score", "distance_score", "area_score"]
+invalid_score_mask = (
+    ~np.isfinite(merged_df[score_columns]).all(axis=1)
+    | (merged_df[score_columns] < 0).any(axis=1)
+    | (merged_df[score_columns] > 100).any(axis=1)
+)
+if invalid_score_mask.any():
+    raise ValueError("0~100 범위를 벗어난 상대점수가 있습니다.")
+
+print(
+    "상대점수 참조분포 생성 완료: "
+    f"평시 {len(normal_train_df)}일 × 행정동 {len(reference_dong_df)}개 "
+    f"= {len(normal_load_reference)}건"
+)
+
+# 8. 기존 LT (Lead Time) 산정 로직
 # 다음 단계에서 상대적 LT 지연 위험지수로 교체할 예정이며,
 # 이번 단계에서는 비교 검증을 위해 기존 산식을 유지한다.
 merged_df["travel_time_min"] = round(
@@ -394,7 +525,7 @@ merged_df["total_lt_hours"] = round(
     2,
 )  # 총 LT(시간)
 
-# 8. 기존 과부하 및 지연 위험도(Risk) 종합 산정
+# 9. 기존 과부하 및 지연 위험도(Risk) 종합 산정
 load_threshold = merged_df["volume_per_courier"].quantile(0.90)
 lt_threshold = merged_df["total_lt_hours"].quantile(0.90)
 
@@ -416,9 +547,9 @@ def calculate_risk(row):
 
 merged_df["overall_risk"] = merged_df.apply(calculate_risk, axis=1)
 
-print("행정동별 배분, 집배원 부하, LT 산정 및 종합 위험도 계산 완료!")
+print("행정동별 배분, 상대점수 및 기존 LT·위험도 계산 완료!")
 
-# 9. 최종 결과 CSV 파일로 저장
+# 10. 최종 결과 CSV 파일로 저장
 output_filename = (
     PROJECT_ROOT
     / "data/processed/district_allocation_load_risk_results.csv"
@@ -437,6 +568,9 @@ print(
             "volume_per_courier",
             "office_dong_distance_km",
             "sqrt_area_km",
+            "load_score",
+            "distance_score",
+            "area_score",
             "total_lt_hours",
             "overall_risk",
         ]
