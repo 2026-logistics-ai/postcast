@@ -31,6 +31,11 @@ dong_info.columns = dong_info.columns.str.strip()
 po_coord.columns = po_coord.columns.str.strip()
 bulk_plan.columns = bulk_plan.columns.str.strip()
 
+# CSV 저장 과정에서 생성된 불필요한 인덱스 컬럼 제거
+dong_info = dong_info.loc[
+    :, ~dong_info.columns.str.match(r"^Unnamed(?::\s*\d+)?$")
+]
+
 
 def validate_required_columns(df, required_columns, dataset_name):
     missing_columns = sorted(set(required_columns) - set(df.columns))
@@ -307,26 +312,66 @@ for idx, row in pred_df.iterrows():
                 "event_type": event_type,
                 "plan_ids": "|".join(active_plan_ids) or "없음",
                 "allocation_event_type": allocation_event_type,
-                "no_event_allocated_volume": round(
-                    no_event_allocated_volume, 2
-                ),
-                "allocated_volume_low": round(
-                    allocated_volumes["low"], 2
-                ),
-                "allocated_volume_base": round(
-                    allocated_volumes["base"], 2
-                ),
-                "allocated_volume_high": round(
-                    allocated_volumes["high"], 2
-                ),
+                "no_event_allocated_volume": no_event_allocated_volume,
+                "allocated_volume_low": allocated_volumes["low"],
+                "allocated_volume_base": allocated_volumes["base"],
+                "allocated_volume_high": allocated_volumes["high"],
                 # 기존 하위 로직과의 호환성을 위한 기준 시나리오 별칭
-                "allocated_volume": round(
-                    allocated_volumes["base"], 2
-                ),
+                "allocated_volume": allocated_volumes["base"],
             }
         )
 
 allocated_df = pd.DataFrame(results)
+
+# 저장 전 날짜별 배분 합계가 대전 전체 예측 물량과 일치하는지 검증
+allocated_totals = allocated_df.groupby("date", as_index=False)[
+    [
+        "no_event_allocated_volume",
+        "allocated_volume_low",
+        "allocated_volume_base",
+        "allocated_volume_high",
+    ]
+].sum()
+expected_totals = pred_df[
+    [
+        "접수일자",
+        "stage1_baseline_prediction",
+        "plan_prediction_low",
+        "plan_prediction_base",
+        "plan_prediction_high",
+    ]
+].rename(columns={"접수일자": "date"})
+allocation_total_check = expected_totals.merge(
+    allocated_totals,
+    on="date",
+    how="outer",
+    validate="one_to_one",
+    indicator=True,
+)
+if not allocation_total_check["_merge"].eq("both").all():
+    raise ValueError("예측일과 행정동 배분 결과의 날짜 구성이 일치하지 않습니다.")
+
+total_column_pairs = {
+    "stage1_baseline_prediction": "no_event_allocated_volume",
+    "plan_prediction_low": "allocated_volume_low",
+    "plan_prediction_base": "allocated_volume_base",
+    "plan_prediction_high": "allocated_volume_high",
+}
+for expected_column, allocated_column in total_column_pairs.items():
+    if not np.allclose(
+        allocation_total_check[expected_column],
+        allocation_total_check[allocated_column],
+        rtol=1e-10,
+        atol=1e-6,
+    ):
+        max_difference = (
+            allocation_total_check[expected_column]
+            - allocation_total_check[allocated_column]
+        ).abs().max()
+        raise ValueError(
+            f"{allocated_column}의 날짜별 배분 총량이 전체 예측량과 "
+            f"일치하지 않습니다. 최대 차이: {max_difference}"
+        )
 
 # 4. 집배원 정보 및 좌표/면적 결합
 dong_info_clean = dong_info.rename(
@@ -1064,8 +1109,79 @@ output_filename = (
 )
 merged_df.to_csv(output_filename, index=False, encoding="utf-8-sig")
 
+# 13. 대시보드용 핵심 컬럼 CSV 저장
+dashboard_columns = [
+    "date",
+    "시구",
+    "행정동",
+    "담당 우체국명",
+    "event_type",
+    "allocation_event_type",
+    "plan_ids",
+    "집배원수",
+    "세대수",
+    "사업체수",
+    "면적 (㎢)",
+    "행정동_위도",
+    "행정동_경도",
+    "담당 우체국 위도",
+    "담당 우체국 경도",
+    "office_dong_distance_km",
+    "no_event_allocated_volume",
+    "allocated_volume_low",
+    "allocated_volume_base",
+    "allocated_volume_high",
+    "event_added_volume_base",
+    "no_event_volume_per_courier",
+    "volume_per_courier_low",
+    "volume_per_courier_base",
+    "volume_per_courier_high",
+    "event_added_volume_per_courier_base",
+    "no_event_load_score",
+    "load_score_base",
+    "distance_score",
+    "area_score",
+    "no_event_relative_lt_risk_index",
+    "relative_lt_risk_index_low",
+    "relative_lt_risk_index_base",
+    "relative_lt_risk_index_high",
+    "event_risk_delta_low",
+    "event_risk_delta_base",
+    "event_risk_delta_high",
+    "relative_risk_level_low",
+    "relative_risk_level_base",
+    "relative_risk_level_high",
+    "daily_priority_rank_low",
+    "daily_priority_rank_base",
+    "daily_priority_rank_high",
+    "event_uplift_rank_low",
+    "event_uplift_rank_base",
+    "event_uplift_rank_high",
+]
+missing_dashboard_columns = sorted(
+    set(dashboard_columns) - set(merged_df.columns)
+)
+if missing_dashboard_columns:
+    raise ValueError(
+        "대시보드용 결과에 필요한 컬럼이 없습니다: "
+        f"{missing_dashboard_columns}"
+    )
+
+dashboard_df = (
+    merged_df[dashboard_columns]
+    .sort_values(["date", "daily_priority_rank_base"])
+    .reset_index(drop=True)
+)
+dashboard_output_filename = (
+    PROJECT_ROOT / "data/processed/district_risk_dashboard.csv"
+)
+dashboard_df.to_csv(
+    dashboard_output_filename, index=False, encoding="utf-8-sig"
+)
+
 print("\n모든 행정동 배분 및 상대 위험지수 산정이 완료되었습니다")
 print(f"결과 파일 업데이트 완료: {output_filename}")
+print(f"대시보드 파일 업데이트 완료: {dashboard_output_filename}")
 print("\n--- [이벤트 상승 우선순위 샘플 5건] ---")
 print(
     merged_df.loc[has_event_plan].sort_values(
